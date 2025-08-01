@@ -1,0 +1,59 @@
+package com.example.service;
+
+import io.quarkus.runtime.StartupEvent;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+
+@ApplicationScoped
+public class RateLimiterService {
+    
+    private static final Logger log = Logger.getLogger(RateLimiterService.class.getName());
+    
+    @ConfigProperty(name = "rate.limit.per.second", defaultValue = "100")
+    int rateLimitPerSecond;
+    
+    private Semaphore rateLimiter;
+    private ScheduledExecutorService rateLimitResetExecutor;
+    private ExecutorService virtualThreadExecutor;
+    
+    void onStart(@Observes StartupEvent event) {
+        this.rateLimiter = new Semaphore(rateLimitPerSecond);
+        this.rateLimitResetExecutor = Executors.newScheduledThreadPool(1);
+        this.virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        
+        // Reset do rate limiter a cada segundo
+        rateLimitResetExecutor.scheduleAtFixedRate(() -> {
+            int currentPermits = rateLimiter.availablePermits();
+            int permitsToAdd = rateLimitPerSecond - currentPermits;
+            if (permitsToAdd > 0) {
+                rateLimiter.release(permitsToAdd);
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+        
+        log.info("Rate Limiter iniciado - " + rateLimitPerSecond + " TPS");
+    }
+    
+    public Uni<Boolean> tryAcquire() {
+        return Uni.createFrom().item(() -> {
+            try {
+                return rateLimiter.tryAcquire(500, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }).runSubscriptionOn(virtualThreadExecutor);
+    }
+    
+    public int getAvailablePermits() {
+        return rateLimiter.availablePermits();
+    }
+}
