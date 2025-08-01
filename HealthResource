@@ -1,0 +1,26 @@
+package com.example.health;
+
+import io.smallrye.mutiny.Uni;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.MediaType;
+import com.example.service.RateLimiterService;
+
+@Path("/health")
+public class HealthResource {
+    
+    @Inject
+    RateLimiterService rateLimiter;
+    
+    @GET
+    @Path("/rate-limiter")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Uni<RateLimiterHealth> getRateLimiterHealth() {
+        return Uni.createFrom().item(() -> 
+            new RateLimiterHealth("UP", rateLimiter.getAvailablePermits()));
+    }
+    
+    record RateLimiterHealth(String status, int availablePermits) {}
+}
