@@ -1,0 +1,158 @@
+package org.acme.sqs.consumer;
+
+import io.quarkus.scheduler.Scheduled;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.Message;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
+import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
+import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Logger;
+
+@ApplicationScoped
+public class SqsMessageConsumer {
+
+    private static final Logger LOGGER = Logger.getLogger(SqsMessageConsumer.class.getName());
+    private static final int MAX_RETRIES = 3;
+    private static final int BASE_VISIBILITY_TIMEOUT = 10;
+    private static final int MESSAGES_PER_CYCLE = 100; // 100 msg/instância/ciclo
+
+    @Inject
+    SqsClient sqsClient;
+
+    @Inject
+    ExternalService externalService;
+
+    @ConfigProperty(name = "queue.url")
+    String queueUrl;
+
+    private final AtomicBoolean processingActive = new AtomicBoolean(false);
+    private final Semaphore rateLimiter = new Semaphore(100); // 100 TPS por instância
+    private final AtomicInteger totalProcessed = new AtomicInteger(0);
+
+    @Scheduled(every = "1s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
+    void scheduleBatchProcessing() {
+        if (!processingActive.compareAndSet(false, true)) {
+            LOGGER.warning("Previous batch still processing. Skipping this cycle.");
+            return;
+        }
+
+        try {
+            Instant start = Instant.now();
+            totalProcessed.set(0);
+            
+            // Usando um ExecutorService de Virtual Threads
+            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                // Recebe todas as mensagens de uma vez
+                List<Message> messages = receiveMessages(MESSAGES_PER_CYCLE);
+                
+                // Processa cada mensagem em uma virtual thread separada
+                for (Message message : messages) {
+                    executor.submit(() -> processMessageWithRateLimit(message));
+                }
+                
+                // Aguarda até que todas as tarefas sejam concluídas ou até o timeout
+                executor.shutdown();
+                if (!executor.awaitTermination(950, TimeUnit.MILLISECONDS)) {
+                    LOGGER.warning("Batch processing timed out before completing all tasks");
+                }
+            }
+
+            long elapsed = Duration.between(start, Instant.now()).toMillis();
+            long remaining = 1000 - elapsed;
+
+            if (remaining > 0) {
+                LOGGER.info(String.format("Processed %d messages in %dms. Sleeping %dms", 
+                        totalProcessed.get(), elapsed, remaining));
+                Thread.sleep(remaining);
+            } else {
+                LOGGER.warning(String.format("Batch processing took too long! %dms. Processed: %d/%d", 
+                        elapsed, totalProcessed.get(), MESSAGES_PER_CYCLE));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            processingActive.set(false);
+        }
+    }
+
+    private void processMessageWithRateLimit(Message message) {
+        try {
+            rateLimiter.acquire(); // Garante o rate limiting
+            processSingleMessage(message);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void processSingleMessage(Message message) {
+        try {
+            externalService.call(message.body());
+            deleteMessage(message);
+            totalProcessed.incrementAndGet();
+        } catch (Exception e) {
+            handleProcessingFailure(message, e);
+        }
+    }
+
+    private List<Message> receiveMessages(int maxMessages) {
+        try {
+            return sqsClient.receiveMessage(ReceiveMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .maxNumberOfMessages(maxMessages)
+                    .waitTimeSeconds(0)
+                    .attributeNamesWithStrings("ApproximateReceiveCount")
+                    .build()).messages();
+        } catch (Exception e) {
+            LOGGER.severe("Error receiving messages: " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    private void handleProcessingFailure(Message message, Exception ex) {
+        try {
+            String receiveCountStr = message.attributes().get("ApproximateReceiveCount");
+            int receiveCount = receiveCountStr != null ? Integer.parseInt(receiveCountStr) : 1;
+
+            if (receiveCount > MAX_RETRIES) {
+                LOGGER.warning("Message exceeded max retries: " + message.body());
+            } else {
+                int newVisibilityTimeout = (int) (Math.pow(2, receiveCount) * BASE_VISIBILITY_TIMEOUT);
+                rescheduleMessage(message, newVisibilityTimeout);
+            }
+        } catch (Exception e) {
+            LOGGER.severe("Error handling failed message: " + e.getMessage());
+        }
+    }
+
+    private void deleteMessage(Message message) {
+        try {
+            sqsClient.deleteMessage(DeleteMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(message.receiptHandle())
+                .build());
+        } catch (Exception e) {
+            LOGGER.severe("Error deleting message: " + e.getMessage());
+        }
+    }
+
+    private void rescheduleMessage(Message message, int visibilityTimeout) {
+        try {
+            sqsClient.changeMessageVisibility(ChangeMessageVisibilityRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(message.receiptHandle())
+                .visibilityTimeout(visibilityTimeout)
+                .build());
+        } catch (Exception e) {
+            LOGGER.severe("Error rescheduling message: " + e.getMessage());
+        }
+    }
+}
