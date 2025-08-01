@@ -1,0 +1,51 @@
+package com.example.scheduler;
+
+import io.quarkus.scheduler.Scheduled;
+import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import com.example.service.MessageProcessingService;
+import com.example.model.ProcessingResult;
+
+import java.util.logging.Logger;
+
+@ApplicationScoped
+public class SQSScheduler {
+    
+    private static final Logger log = Logger.getLogger(SQSScheduler.class.getName());
+    
+    @Inject
+    MessageProcessingService processingService;
+    
+    @ConfigProperty(name = "processor.threads.count", defaultValue = "10")
+    int threadsCount;
+    
+    @Scheduled(every = "1s")
+    public void processMessages() {
+        Multi.createFrom().range(0, threadsCount)
+            .onItem().transformToUni(threadIndex -> 
+                processingService.processThreadMessages(threadIndex))
+            .merge()
+            .collect().asList()
+            .map(this::aggregateResults)
+            .subscribe().with(
+                this::logResults,
+                failure -> log.severe("Erro no processamento: " + failure.getMessage())
+            );
+    }
+    
+    private ProcessingResult aggregateResults(java.util.List<ProcessingResult> results) {
+        int processed = results.stream().mapToInt(ProcessingResult::processed).sum();
+        int rateLimited = results.stream().mapToInt(ProcessingResult::rateLimited).sum();
+        int errors = results.stream().mapToInt(ProcessingResult::errors).sum();
+        
+        return new ProcessingResult(processed, rateLimited, errors);
+    }
+    
+    private void logResults(ProcessingResult result) {
+        log.info(String.format("Ciclo concluído - Processadas: %d, Rate Limited: %d, Erros: %d",
+            result.processed(), result.rateLimited(), result.errors()));
+    }
+}
