@@ -1,0 +1,37 @@
+package com.example.service;
+
+import io.smallrye.mutiny.Uni;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.MediaType;
+import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
+
+import java.time.Duration;
+
+@RegisterRestClient(configKey = "external-service")
+public interface ExternalServiceClient {
+    
+    @POST
+    @Path("/messages")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    default Uni<ExternalServiceResponse> sendMessage(ExternalServiceRequest request) {
+        return sendMessageRaw(request)
+            .onFailure().retry()
+                .withBackOff(Duration.ofSeconds(1), Duration.ofSeconds(5))
+                .atMost(2);
+    }
+    
+    @POST
+    @Path("/messages")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    Uni<ExternalServiceResponse> sendMessageRaw(ExternalServiceRequest request);
+}
+
+// DTOs
+record ExternalServiceRequest(String content) {}
+
+record ExternalServiceResponse(boolean success, String errorMessage) {}
