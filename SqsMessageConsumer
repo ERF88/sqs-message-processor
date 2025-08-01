@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,7 +24,9 @@ public class SqsMessageConsumer {
     private static final Logger LOGGER = Logger.getLogger(SqsMessageConsumer.class.getName());
     private static final int MAX_RETRIES = 3;
     private static final int BASE_VISIBILITY_TIMEOUT = 10;
+    private static final int MAX_MESSAGES_PER_RECEIVE = 10; // Limite do SQS
     private static final int MESSAGES_PER_CYCLE = 100; // 100 msg/instância/ciclo
+    private static final int MAX_RECEIVE_CALLS = 10; // 100 msg / 10 por chamada
 
     @Inject
     SqsClient sqsClient;
@@ -35,7 +38,7 @@ public class SqsMessageConsumer {
     String queueUrl;
 
     private final AtomicBoolean processingActive = new AtomicBoolean(false);
-    private final Semaphore rateLimiter = new Semaphore(100); // 100 TPS por instância
+    private final Semaphore rateLimiter = new Semaphore(MESSAGES_PER_CYCLE); // 100 TPS por instância
     private final AtomicInteger totalProcessed = new AtomicInteger(0);
 
     @Scheduled(every = "1s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
@@ -49,17 +52,16 @@ public class SqsMessageConsumer {
             Instant start = Instant.now();
             totalProcessed.set(0);
             
-            // Usando um ExecutorService de Virtual Threads
+            // Receber mensagens em múltiplos lotes de até 10
+            List<Message> messages = receiveMessagesInBatches();
+            LOGGER.info("Received " + messages.size() + " messages for processing");
+            
+            // Processar com virtual threads
             try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-                // Recebe todas as mensagens de uma vez
-                List<Message> messages = receiveMessages(MESSAGES_PER_CYCLE);
-                
-                // Processa cada mensagem em uma virtual thread separada
                 for (Message message : messages) {
                     executor.submit(() -> processMessageWithRateLimit(message));
                 }
                 
-                // Aguarda até que todas as tarefas sejam concluídas ou até o timeout
                 executor.shutdown();
                 if (!executor.awaitTermination(950, TimeUnit.MILLISECONDS)) {
                     LOGGER.warning("Batch processing timed out before completing all tasks");
@@ -75,7 +77,7 @@ public class SqsMessageConsumer {
                 Thread.sleep(remaining);
             } else {
                 LOGGER.warning(String.format("Batch processing took too long! %dms. Processed: %d/%d", 
-                        elapsed, totalProcessed.get(), MESSAGES_PER_CYCLE));
+                        elapsed, totalProcessed.get(), messages.size()));
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -84,12 +86,30 @@ public class SqsMessageConsumer {
         }
     }
 
+    private List<Message> receiveMessagesInBatches() {
+        List<Message> allMessages = new ArrayList<>(MESSAGES_PER_CYCLE);
+        int receivedCount = 0;
+        
+        for (int i = 0; i < MAX_RECEIVE_CALLS && receivedCount < MESSAGES_PER_CYCLE; i++) {
+            List<Message> batch = receiveMessages(MAX_MESSAGES_PER_RECEIVE);
+            allMessages.addAll(batch);
+            receivedCount += batch.size();
+            
+            if (batch.size() < MAX_MESSAGES_PER_RECEIVE) {
+                break; // Menos mensagens que o máximo disponível
+            }
+        }
+        return allMessages;
+    }
+
     private void processMessageWithRateLimit(Message message) {
         try {
-            rateLimiter.acquire(); // Garante o rate limiting
+            rateLimiter.acquire(); // Garante o rate limiting (100 TPS)
             processSingleMessage(message);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } finally {
+            rateLimiter.release();
         }
     }
 
@@ -108,7 +128,7 @@ public class SqsMessageConsumer {
             return sqsClient.receiveMessage(ReceiveMessageRequest.builder()
                     .queueUrl(queueUrl)
                     .maxNumberOfMessages(maxMessages)
-                    .waitTimeSeconds(0)
+                    .waitTimeSeconds(0) // Não espera se não houver mensagens
                     .attributeNamesWithStrings("ApproximateReceiveCount")
                     .build()).messages();
         } catch (Exception e) {
